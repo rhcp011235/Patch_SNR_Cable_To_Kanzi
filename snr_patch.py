@@ -24,10 +24,33 @@ import shutil
 BEFORE = bytes([0x24, 0x21])   # MOVS R1, #0x24  (PID low byte = 0x24 → full PID 0x1624)
 AFTER  = bytes([0x21, 0x21])   # MOVS R1, #0x21  (PID low byte = 0x21 → full PID 0x1621)
 
-# Unique 4-byte signatures including the preceding IT EQ instruction (0x08 0xBF),
-# which makes the match unambiguous even though 21 21 appears naturally elsewhere.
-SIG_BEFORE = bytes([0x08, 0xBF, 0x24, 0x21])   # IT EQ + MOVEQ R1, #0x24 (unpatched)
-SIG_AFTER  = bytes([0x08, 0xBF, 0x21, 0x21])   # IT EQ + MOVEQ R1, #0x21 (patched)
+# Each entry describes one firmware version's PID assignment pattern.
+#   sig_before   : byte sequence when unpatched (SNR PID)
+#   sig_after    : byte sequence when patched   (Kanzi PID)
+#   insn_offset  : byte offset within the signature where the 2-byte instruction lives
+#   name         : human-readable version label
+#
+# v1.x  uses IT EQ:   CMP R0,#4 / IT EQ / MOVEQ R1,#0x24 / STRB
+# v1.07 uses ITE NE:  CMP R0,#4 / ITE NE / MOVNE R1,#0x21 / MOVEQ R1,#0x24 / STRB
+#   Both patch the same byte: 0x24 → 0x21 in the MOVEQ instruction.
+PATCH_SPECS = [
+    {
+        'name':        'v1.x (IT EQ)',
+        'sig_before':  bytes([0x08, 0xBF, 0x24, 0x21]),  # IT EQ + MOVEQ R1,#0x24
+        'sig_after':   bytes([0x08, 0xBF, 0x21, 0x21]),  # IT EQ + MOVEQ R1,#0x21
+        'insn_offset': 2,
+    },
+    {
+        'name':        'v1.07 (ITE NE)',
+        'sig_before':  bytes([0x14, 0xBF, 0x21, 0x21, 0x24, 0x21]),  # ITE NE + MOVNE R1,#0x21 + MOVEQ R1,#0x24
+        'sig_after':   bytes([0x14, 0xBF, 0x21, 0x21, 0x21, 0x21]),  # ITE NE + MOVNE R1,#0x21 + MOVEQ R1,#0x21
+        'insn_offset': 4,
+    },
+]
+
+# Convenience aliases used by _bytes_label and legacy paths
+SIG_BEFORE = PATCH_SPECS[0]['sig_before']
+SIG_AFTER  = PATCH_SPECS[0]['sig_after']
 
 FW_START = 0x4000
 FW_LEN_OFFSET = 0x1C          # relative to FW_START
@@ -103,24 +126,36 @@ def check(input_path: str) -> None:
     print(f"CRC:      stored=0x{stored_crc:08x}  computed=0x{computed_crc:08x}  {'OK' if crc_ok else 'MISMATCH'}")
     print(f"          full-check (should be 0): 0x{crc_full:08x}  {'OK' if crc_full == 0 else 'FAIL'}")
 
-    # Find patch targets using the 4-byte signature (IT EQ + instruction) to avoid
-    # false positives from naturally-occurring 21 21 / 24 21 bytes elsewhere.
-    def find_sig(sig: bytes) -> list[int]:
-        """Return fw-relative offsets where sig occurs at an even (2-byte aligned) boundary."""
+    # Scan all known patch specs for both unpatched and patched signatures.
+    def find_sig_for_spec(sig: bytes, insn_offset: int) -> list[int]:
         results = []
         offset = 0
         while True:
             idx = firmware.find(sig, offset)
             if idx == -1:
                 break
-            # The instruction itself starts 2 bytes in; check that boundary is even
-            if (idx + 2) % 2 == 0:
-                results.append(idx + 2)   # point at the instruction, not the IT prefix
+            insn_off = idx + insn_offset
+            if insn_off % 2 == 0:
+                results.append(insn_off)
             offset = idx + 1
         return results
 
-    targets_before = find_sig(SIG_BEFORE)
-    targets_after  = find_sig(SIG_AFTER)
+    matched_spec = None
+    targets_before = []
+    targets_after  = []
+
+    for spec in PATCH_SPECS:
+        tb = find_sig_for_spec(spec['sig_before'], spec['insn_offset'])
+        ta = find_sig_for_spec(spec['sig_after'],  spec['insn_offset'])
+        if tb or ta:
+            matched_spec = spec
+            targets_before = tb
+            targets_after  = ta
+            break   # first matching spec wins
+
+    if matched_spec is None:
+        print("\nERROR: No known patch signature found in this firmware.")
+        sys.exit(1)
 
     # Determine state
     if targets_before and not targets_after:
@@ -136,45 +171,42 @@ def check(input_path: str) -> None:
         targets = targets_before + targets_after
         patch_bytes = BEFORE
     else:
-        print("\nERROR: Patch target not found (neither IT EQ + 0x24 nor IT EQ + 0x21).")
+        print("\nERROR: Patch target not found.")
         sys.exit(1)
 
+    print(f"Version:  {matched_spec['name']}")
     print(f"State:    {state}")
     print()
 
-    CONTEXT_BEFORE = 12   # bytes of code to show before patch site
+    CONTEXT_BEFORE = 16   # bytes of code to show before patch site
     CONTEXT_AFTER  = 16   # bytes of code to show after patch site
 
     for fw_rel in targets:
         file_off = FW_START + fw_rel
-        region_start = max(FW_START, file_off - CONTEXT_BEFORE) & ~1  # align to 2
-        region_len   = (file_off - region_start) + len(patch_bytes) + CONTEXT_AFTER
+        region_start = max(FW_START, file_off - CONTEXT_BEFORE) & ~1
+        region_len   = (file_off - region_start) + len(BEFORE) + CONTEXT_AFTER
 
         print(f"Patch site @ fw+0x{fw_rel:04x}  (file 0x{file_off:05x},  STM32 0x{0x08000000+file_off:08x})")
-        print(f"  Change: {BEFORE.hex(' ')} ({_bytes_label(BEFORE)})  →  "
+        print(f"  Change: {BEFORE.hex(' ')} ({_bytes_label(BEFORE)})  ->  "
               f"{AFTER.hex(' ')} ({_bytes_label(AFTER)})")
         print()
 
         if state == "UNPATCHED":
-            # Show current (unpatched) disassembly
             print("  -- Current (unpatched) --")
             disassemble_region(data, region_start, region_len, file_off, len(BEFORE))
             print()
-            # Show simulated patched disassembly
-            patched = bytearray(data)
-            patched[file_off:file_off + len(BEFORE)] = AFTER
+            patched_sim = bytearray(data)
+            patched_sim[file_off:file_off + len(BEFORE)] = AFTER
             print("  -- After patch --")
-            disassemble_region(bytes(patched), region_start, region_len, file_off, len(AFTER))
+            disassemble_region(bytes(patched_sim), region_start, region_len, file_off, len(AFTER))
         else:
-            # Already patched — show current (patched) state
             print("  -- Current (patched) --")
             disassemble_region(data, region_start, region_len, file_off, len(AFTER))
             print()
-            # Show what the original looked like
-            original = bytearray(data)
-            original[file_off:file_off + len(AFTER)] = BEFORE
+            original_sim = bytearray(data)
+            original_sim[file_off:file_off + len(AFTER)] = BEFORE
             print("  -- Original (pre-patch) --")
-            disassemble_region(bytes(original), region_start, region_len, file_off, len(BEFORE))
+            disassemble_region(bytes(original_sim), region_start, region_len, file_off, len(BEFORE))
 
 
 def _bytes_label(b: bytes) -> str:
@@ -186,21 +218,35 @@ def _bytes_label(b: bytes) -> str:
     return b.hex(' ')
 
 
-def find_patch_targets(fw_data: bytes) -> list[int]:
+def find_patch_targets(fw_data: bytes) -> tuple[list[int], dict]:
     """
-    Find all 2-byte-aligned occurrences of BEFORE in the firmware body.
-    Skips the first 0x10 bytes (vector table area, not real code).
+    Scan fw_data for a known unpatched signature across all PATCH_SPECS.
+    Returns (list of fw-relative instruction offsets, matched spec dict).
+    Raises SystemExit if no spec matches or multiple specs match (ambiguous).
     """
-    targets = []
-    offset = 0
-    while True:
-        idx = fw_data.find(BEFORE, offset)
-        if idx == -1:
-            break
-        if idx % 2 == 0:
-            targets.append(idx)
-        offset = idx + 1
-    return targets
+    matched_spec = None
+    matched_targets = []
+
+    for spec in PATCH_SPECS:
+        targets = []
+        offset = 0
+        while True:
+            idx = fw_data.find(spec['sig_before'], offset)
+            if idx == -1:
+                break
+            insn_off = idx + spec['insn_offset']
+            if insn_off % 2 == 0:
+                targets.append(insn_off)
+            offset = idx + 1
+
+        if targets:
+            if matched_spec is not None:
+                print("ERROR: multiple patch specs matched — ambiguous firmware.")
+                sys.exit(1)
+            matched_spec = spec
+            matched_targets = targets
+
+    return matched_targets, matched_spec
 
 
 def patch(input_path: str, output_path: str) -> None:
@@ -225,27 +271,17 @@ def patch(input_path: str, output_path: str) -> None:
     print("CRC verified OK")
 
     # Find patch location(s) within firmware region
-    fw_region = firmware_body
-    targets = find_patch_targets(fw_region)
+    targets, spec = find_patch_targets(firmware_body)
 
-    aligned_targets = [t for t in targets if t % 2 == 0]
-    print(f"Found {len(aligned_targets)} aligned occurrence(s) of {BEFORE.hex(' ')}")
-
-    if not aligned_targets:
-        print("ERROR: Patch target not found in firmware!")
+    if not targets:
+        print("ERROR: Patch target not found — no known signature matched this firmware.")
         sys.exit(1)
 
-    if len(aligned_targets) > 1:
-        print("Multiple matches found:")
-        for t in aligned_targets:
-            ctx = fw_region[max(0,t-4):t+8].hex(' ')
-            print(f"  fw+0x{t:04x} (file 0x{FW_START+t:05x}): ...{ctx}...")
-        # For the SNR patch, we want the one that follows an IT EQ / condition code
-        # The correct one is typically preceded by a conditional IT instruction
-        # Default: patch all (usually only 1 real match anyway)
+    print(f"Firmware version pattern: {spec['name']}")
+    print(f"Found {len(targets)} patch target(s)")
 
     patched_count = 0
-    for t in aligned_targets:
+    for t in targets:
         file_offset = FW_START + t
         ctx_before = bytes(data[max(0,file_offset-4):file_offset+8]).hex(' ')
         data[file_offset:file_offset+2] = AFTER
